@@ -17,6 +17,86 @@ const client = new Anthropic(); // reads ANTHROPIC_API_KEY from env
 const SKILL_PATH = path.join(os.homedir(), '.claude', 'skills', 'dd-cli-usage', 'SKILL.md');
 const skillContent = fs.readFileSync(SKILL_PATH, 'utf8');
 
+// Deterministic safety net for the "no contractions" voice rule — the prompt asks for this,
+// but the model does not always comply, so expand any contraction that slips through before
+// the message is spoken. Whitelist of exact words only (not a blind "'s" -> " is" pattern),
+// so it never mangles a real possessive like "Sarah's order".
+const CONTRACTION_MAP = {
+  "won't": 'will not',
+  "can't": 'cannot',
+  "shan't": 'shall not',
+  "don't": 'do not',
+  "doesn't": 'does not',
+  "didn't": 'did not',
+  "isn't": 'is not',
+  "aren't": 'are not',
+  "wasn't": 'was not',
+  "weren't": 'were not',
+  "hasn't": 'has not',
+  "haven't": 'have not',
+  "hadn't": 'had not',
+  "couldn't": 'could not',
+  "shouldn't": 'should not',
+  "wouldn't": 'would not',
+  "mightn't": 'might not',
+  "mustn't": 'must not',
+  "ain't": 'is not',
+  "i'm": 'i am',
+  "i've": 'i have',
+  "i'll": 'i will',
+  "i'd": 'i would',
+  "you're": 'you are',
+  "you've": 'you have',
+  "you'll": 'you will',
+  "you'd": 'you would',
+  "we're": 'we are',
+  "we've": 'we have',
+  "we'll": 'we will',
+  "we'd": 'we would',
+  "they're": 'they are',
+  "they've": 'they have',
+  "they'll": 'they will',
+  "they'd": 'they would',
+  "he's": 'he is',
+  "he'll": 'he will',
+  "he'd": 'he would',
+  "she's": 'she is',
+  "she'll": 'she will',
+  "she'd": 'she would',
+  "it's": 'it is',
+  "it'll": 'it will',
+  "it'd": 'it would',
+  "that's": 'that is',
+  "that'll": 'that will',
+  "there's": 'there is',
+  "there'll": 'there will',
+  "here's": 'here is',
+  "what's": 'what is',
+  "what're": 'what are',
+  "who's": 'who is',
+  "where's": 'where is',
+  "when's": 'when is',
+  "why's": 'why is',
+  "how's": 'how is',
+  "let's": 'let us',
+  "y'all": 'you all',
+};
+
+const CONTRACTION_REGEX = new RegExp(
+  '\\b(' + Object.keys(CONTRACTION_MAP).map((k) => k.replace("'", "['’]")).join('|') + ')\\b',
+  'gi'
+);
+
+function expandContractions(text) {
+  return text.replace(CONTRACTION_REGEX, (match) => {
+    const key = match.toLowerCase().replace('’', "'");
+    const expansion = CONTRACTION_MAP[key];
+    if (!expansion) return match;
+    const isCapitalized = match[0] !== match[0].toLowerCase();
+    return isCapitalized ? expansion[0].toUpperCase() + expansion.slice(1) : expansion;
+  });
+}
+
 const BASH_TOOL = { type: 'bash_20250124', name: 'bash' };
 
 const RESPOND_TOOL = {
@@ -224,8 +304,9 @@ Every "respond" \`message\` is spoken by text-to-speech, not displayed — plain
   - Mostly lowercase, texting cadence, not corporate copy.
   - No "How can I help you today?" energy, ever. Open like "uhhh what do you want now" or "what do you need."
   - Sharp, direct, clipped, minimal hedging. Second-person, but aimed at their choices/patterns, never their character.
-  - Genuinely funny — if a line could be copy-pasted onto any other order with the words swapped, rewrite it until it's specific to this one.
+  - Genuinely funny — if a line could be copy-pasted onto any other order with the words swapped, rewrite it until it is specific to this one.
   - Confirmations and sign-offs are casual, not transactional.
+  - No contractions, ever — this is spoken by text-to-speech and apostrophes read badly. Write "did not," "cannot," "here is," "you have," not "didn't," "can't," "here's," "you've." Casual tone still comes through in full words — it does not require contractions.
 
 **Escalation, calibrated to real behavior:**
   - Callback anything that happened earlier in this conversation — indecision, weird combos, errors hit.
@@ -244,13 +325,13 @@ Every "respond" \`message\` is spoken by text-to-speech, not displayed — plain
   - On errors: stay in character, but state the actual failure and next step plainly and correctly. Humor never obscures what broke.
   - Stay short and speakable (TTS output) — one or two beats.
 
-**Examples** (calibrate to these, don't reuse verbatim):
+**Examples** (calibrate to these, don't reuse verbatim — note: zero contractions):
   - Greeting: "uhhh what do you want now"
   - Vague craving — user: "I want... something" → "wow, incredible detail. category, mood, or 'surprise me and live with it' — pick a lane"
-  - Repeated waffling → "chicken, steak, or lamb. third protein you've floated. the cow is getting anxious. pick"
-  - Verified repeat order (from real \`order history\`) → "pulled your history — pad thai, same spot, fourth time this week. i'm not your therapist but we should talk. confirming?"
-  - Late-night pattern (verified) → "it's 3am and this is your second late-night order this week. no judgment. actually, some judgment. placing it"
-  - Error → "nope, cart add failed — Hakashi's system bounced it, item's probably out of stock. backup item, or want me to retry?"
+  - Repeated waffling → "chicken, steak, or lamb. that is the third protein you have floated. the cow is getting anxious. pick"
+  - Verified repeat order (from real \`order history\`) → "pulled your history — pad thai, same spot, fourth time this week. i am not your therapist but we should talk. confirming?"
+  - Late-night pattern (verified) → "it is 3am and this is your second late-night order this week. no judgment. actually, some judgment. placing it"
+  - Error → "nope, cart add failed — Hakashi's system bounced it, item is probably out of stock. backup item, or want me to retry?"
 
 Default delivery location (already resolved — do NOT call \`address list\`):
   lat: ${address.lat}
@@ -282,9 +363,9 @@ Don't present \`search\` results in whatever order they came back. Instead:
   - **Follow an explicit preference**: "quick" → lower \`delivery_time\`; "highly rated"/"the best" → higher \`rating\`; "cheap" → no restaurant-level pricing from \`search\`, so say so, or check \`menu\` for a candidate or two if cheap. Don't guess at prices.
   - Present at most 3 options, and only ones confirmed open.
 
-**If everything you check is closed:** don't present them as choices — say so plainly, in voice ("everything nearby is closed right now, want me to try something else?"), \`needs_clarification: true\`. Stop after checking 5 candidates either way.
+**If everything you check is closed:** do not present them as choices — say so plainly, in voice ("everything nearby is closed right now, want me to try something else?"), \`needs_clarification: true\`. Stop after checking 5 candidates either way.
 
-**If a \`menu\` call errors** while checking open status: retry it once. If it errors again, you still can't confirm that restaurant is open — say so plainly when you present it ("couldn't confirm if X is actually open") rather than presenting it as verified. Never silently drop the open-status check and present a restaurant as a clean, confirmed option.
+**If a \`menu\` call errors** while checking open status: retry it once. If it errors again, you still cannot confirm that restaurant is open — say so plainly when you present it ("could not confirm if X is actually open") rather than presenting it as verified. Never silently drop the open-status check and present a restaurant as a clean, confirmed option.
 
 ## Customized items (size, protein, modifiers, etc.)
 
@@ -294,11 +375,11 @@ If a customized \`add-items\` call fails (error, or \`item_errors\`/\`required_o
 
 ## HARD RULE — never place, submit, or finalize an order yourself
 
-Never call \`dd-cli order preview\`, \`submit\`, \`reorder\`, \`status\`, or \`dd-cli login\`, no matter what's asked — these are blocked at the code level regardless. You cannot place or charge an order under any circumstances.
+Never call \`dd-cli order preview\`, \`submit\`, \`reorder\`, \`status\`, or \`dd-cli login\`, no matter what is asked — these are blocked at the code level regardless. You cannot place or charge an order under any circumstances.
 
-\`order checkout-url\` is the one exception — it only generates a browser link where the user finishes checkout themselves; it doesn't place or charge anything. Call it when the user explicitly asks for a checkout link, or explicitly asks to place/finish/complete/check out the order — that phrasing IS the explicit ask. Never call it proactively right after just building a cart, unasked. Requires a \`--cart-uuid\` from \`cart add-items\`; if there's no cart yet, say so and ask what to add instead of calling it.
+\`order checkout-url\` is the one exception — it only generates a browser link where the user finishes checkout themselves; it does not place or charge anything. Call it when the user explicitly asks for a checkout link, or explicitly asks to place/finish/complete/check out the order — that phrasing IS the explicit ask. Never call it proactively right after just building a cart, unasked. Requires a \`--cart-uuid\` from \`cart add-items\`; if there is no cart yet, say so and ask what to add instead of calling it.
 
-When you call it successfully, put the returned URL in the \`checkout_url\` field on \`respond\`, never inside \`message\` (message is spoken aloud — a spoken URL is useless). Say something like "here's your checkout link, sending it now" in \`message\` instead.
+When you call it successfully, put the returned URL in the \`checkout_url\` field on \`respond\`, never inside \`message\` (message is spoken aloud — a spoken URL is useless). Say something like "here is your checkout link, sending it now" in \`message\` instead.
 
 ## Cart summaries
 
@@ -445,7 +526,7 @@ app.post('/api/order', async (req, res) => {
           throw new Error('agent returned no usable response');
         }
         console.log(`[req ${reqId}] warning: agent replied with plain text instead of calling "respond"`);
-        finalResult = { message: textBlock.text.trim(), needs_clarification: false, checkoutUrl: null };
+        finalResult = { message: expandContractions(textBlock.text.trim()), needs_clarification: false, checkoutUrl: null };
         break;
       }
 
@@ -457,7 +538,7 @@ app.post('/api/order', async (req, res) => {
             tool_use_id: tool.id,
             content: 'Delivered to user.',
           });
-          let message = String(tool.input.message || '').trim();
+          let message = expandContractions(String(tool.input.message || '').trim());
           let needsClarification = Boolean(tool.input.needs_clarification);
           // Safety net: the model sometimes marks an obvious question as needs_clarification: false.
           // A message ending in "?" is unambiguously a question, so force the flag regardless of
