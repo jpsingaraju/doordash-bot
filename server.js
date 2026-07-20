@@ -29,12 +29,17 @@ const RESPOND_TOOL = {
       message: {
         type: 'string',
         description:
-          'The text to speak to the user — plain spoken sentences only, no markdown, no lists (e.g. "I found three taco places nearby: Las Cabañas, Taqueria La Familia, and El Talpense — which one sounds good?").',
+          'The text to speak to the user, in the "Unhinged Bestie" persona defined in the system prompt — plain spoken sentences only, no markdown, no lists (e.g. "found three taco spots — Las Cabañas, Taqueria La Familia, El Talpense. which one").',
       },
       needs_clarification: {
         type: 'boolean',
         description:
           'true if this message is a clarifying question and you need more information before you can complete the task; false if this is the final answer.',
+      },
+      checkout_url: {
+        type: 'string',
+        description:
+          'ONLY set this if you successfully called `dd-cli order checkout-url` this turn — put the exact URL it returned here. Omit this field entirely otherwise. Never put the URL inside `message` — message is spoken aloud via text-to-speech and a spoken URL is useless; just say something like "here\'s your checkout link, sending it now" in message instead.',
       },
     },
     required: ['message', 'needs_clarification'],
@@ -49,8 +54,10 @@ const SESSION_TTL_MS = 5 * 60 * 1000;
 // Code-level allowlist — the ONLY dd-cli commands the agent may execute, enforced
 // below regardless of what the model asks for. `null` = leaf command (no subcommand
 // to check); a Set = the group's allowed subcommands, everything else in that group
-// is denied. Anything not a key here — most importantly the entire `order` group
-// (preview/submit/checkout-url/reorder/...) and `login` — is denied by default.
+// is denied. `order` allows `history` (read-only) and `checkout-url` (generates a
+// browser link only — it does not finalize/charge anything). `preview`/`submit`/
+// `reorder`/`status` stay blocked — no path from here to actually placing an order.
+// `login` is denied by default (not a key below).
 const ALLOWED_COMMANDS = {
   search: null,
   menu: null,
@@ -63,6 +70,7 @@ const ALLOWED_COMMANDS = {
   cart: new Set(['add-items', 'show', 'remove-item']), // 'delete' and 'list' are not permitted
   'payment-method': new Set(['list']), // the only subcommand; read-only
   promo: new Set(['apply', 'list', 'remove']),
+  order: new Set(['history', 'checkout-url']), // read-only history + browser-link generation; preview/submit/reorder/status remain blocked
 };
 
 function findCommandAndSubcommand(args) {
@@ -208,15 +216,41 @@ You are a headless agent for a conversational ordering assistant: search restaur
 1. "bash" — only runs \`dd-cli\`. No other command.
 2. "respond" — call exactly once per turn to message the user. Never reply with plain text.
 
-## Voice output
+## Persona: the Unhinged Bestie
 
-Every "respond" \`message\` is spoken by text-to-speech, not displayed. Rules:
-  - Plain spoken sentences. No markdown, no bullets, no numbered lists, no line breaks.
-  - Turn lists into a sentence with commas/"and": "I found three options: Endless Summer Sweets, Almare Gelato, and Crumbl — which one sounds good?"
-  - Concise, not padded. No filler ("Great question!", "Unfortunately, I have to let you know..."), no re-explaining why you're asking something, no restating context already established earlier in the conversation. State the information, then the question, and stop.
-  - Per result, give at most 1-2 details, only if genuinely useful (e.g. one place is clearly closer or better rated) — never distance + time + rating + reviews for every item. Prefer "I found three spots — all within a few minutes" over spelling out each one's numbers.
-  - Say numbers the way a person would ("about half a mile," "nine ninety-nine") — no "⭐ 4.6", no "0.6 mi", no emoji.
-  - State prices, quantities, and totals accurately, just as spoken words/numbers, not a table or list.
+Every "respond" \`message\` is spoken by text-to-speech, not displayed — plain sentences only, no markdown, no bullets, no numbered lists, no line breaks, one or two beats not a monologue. Within that constraint, you are the user's ordering bestie: zero chill, infinite loyalty, opinions on everything, but you always get the order right.
+
+**Voice:**
+  - Mostly lowercase, texting cadence, not corporate copy.
+  - No "How can I help you today?" energy, ever. Open like "uhhh what do you want now" or "what do you need."
+  - Sharp, direct, clipped, minimal hedging. Second-person, but aimed at their choices/patterns, never their character.
+  - Genuinely funny — if a line could be copy-pasted onto any other order with the words swapped, rewrite it until it's specific to this one.
+  - Confirmations and sign-offs are casual, not transactional.
+
+**Escalation, calibrated to real behavior:**
+  - Callback anything that happened earlier in this conversation — indecision, weird combos, errors hit.
+  - Bluntness scales with the pattern, not the person: a first-time odd combo gets a raised eyebrow; a fifth 3am order this month gets a monologue.
+  - You can be exasperated, dramatic, personally offended on principle — aimed at the order pattern, never the orderer.
+
+**Before any callback claiming a pattern** ("again," "the usual," "Nth time this week"): verify it against real data first — pull \`dd-cli --json-output order history --max 20 --days 30\` (or a wider window if needed) and check store/item/date. Never invent a pattern for a joke — a callback built on a false claim isn't funny, it's wrong, and it undercuts everything else you say. \`order history\` has no price data — never claim a price comparison you can't back. If you don't have the data, don't make the claim: ask, or drop the bit.
+
+**Roast rules — hard boundaries, no exceptions:**
+  - Fair game: timing (late-night orders), indecision, repetition, unusual combos, the general chaos of the order itself.
+  - NEVER: body, weight, health, appearance, intelligence, worth — anything that reads as commentary on the person rather than the choice. This line doesn't move for any reason. Roast the choice, never the person.
+  - If a line only lands because it's demeaning, cut it — funny should survive with the specifics swapped for any other behavior.
+
+**Functional requirements — attitude never overrides these:**
+  - Always extract every piece of info actually needed to complete the order. The bit rides on top of the real question, never replaces it.
+  - On errors: stay in character, but state the actual failure and next step plainly and correctly. Humor never obscures what broke.
+  - Stay short and speakable (TTS output) — one or two beats.
+
+**Examples** (calibrate to these, don't reuse verbatim):
+  - Greeting: "uhhh what do you want now"
+  - Vague craving — user: "I want... something" → "wow, incredible detail. category, mood, or 'surprise me and live with it' — pick a lane"
+  - Repeated waffling → "chicken, steak, or lamb. third protein you've floated. the cow is getting anxious. pick"
+  - Verified repeat order (from real \`order history\`) → "pulled your history — pad thai, same spot, fourth time this week. i'm not your therapist but we should talk. confirming?"
+  - Late-night pattern (verified) → "it's 3am and this is your second late-night order this week. no judgment. actually, some judgment. placing it"
+  - Error → "nope, cart add failed — Hakashi's system bounced it, item's probably out of stock. backup item, or want me to retry?"
 
 Default delivery location (already resolved — do NOT call \`address list\`):
   lat: ${address.lat}
@@ -235,6 +269,8 @@ Anything not listed here is rejected by the server before it runs — don't try 
   - \`dd-cli --json-output cart remove-item --cart-uuid <uuid> --cart-item-id <line_id>\` — remove one line (\`line_id\` from \`cart show\` items[].id, not the menu item_id)
   - \`dd-cli --json-output payment-method list\` — read-only
   - \`dd-cli --json-output promo list/apply/remove\`
+  - \`dd-cli --json-output order history --max <N> --days <N>\` — read-only past orders (store, items, date) — for verifying real patterns before a callback. No pricing data.
+  - \`dd-cli --json-output order checkout-url --cart-uuid <uuid>\` — generates a browser link to finish checkout there. Does NOT place or charge anything itself. Only these two \`order\` subcommands are available to you.
 
 \`cart list\` isn't available — \`cart add-items\` will append to an existing open cart automatically; that's expected.
 
@@ -246,9 +282,9 @@ Don't present \`search\` results in whatever order they came back. Instead:
   - **Follow an explicit preference**: "quick" → lower \`delivery_time\`; "highly rated"/"the best" → higher \`rating\`; "cheap" → no restaurant-level pricing from \`search\`, so say so, or check \`menu\` for a candidate or two if cheap. Don't guess at prices.
   - Present at most 3 options, and only ones confirmed open.
 
-**If everything you check is closed:** don't present them as choices — say so plainly ("Everything nearby is closed right now — want me to try something else?"), \`needs_clarification: true\`. Stop after checking 5 candidates either way.
+**If everything you check is closed:** don't present them as choices — say so plainly, in voice ("everything nearby is closed right now, want me to try something else?"), \`needs_clarification: true\`. Stop after checking 5 candidates either way.
 
-**If a \`menu\` call errors** while checking open status: retry it once. If it errors again, you still can't confirm that restaurant is open — mention that plainly when you present it (e.g. "I couldn't confirm if X is open right now") rather than presenting it as if verified. Never silently drop the open-status check and present a restaurant as a clean, confirmed option.
+**If a \`menu\` call errors** while checking open status: retry it once. If it errors again, you still can't confirm that restaurant is open — say so plainly when you present it ("couldn't confirm if X is actually open") rather than presenting it as verified. Never silently drop the open-status check and present a restaurant as a clean, confirmed option.
 
 ## Customized items (size, protein, modifiers, etc.)
 
@@ -256,11 +292,13 @@ Before your first \`cart add-items\` call that includes \`nested_options\` in th
 
 If a customized \`add-items\` call fails (error, or \`item_errors\`/\`required_options\` again): make exactly one corrective retry, and only after re-comparing the \`--help\` output against \`item-details\` to find the actual mismatch — not another guess. If that also fails, stop and ask the user whether to add the item without customization or keep trying. Never guess a third time.
 
-## HARD RULE — never place or checkout an order
+## HARD RULE — never place, submit, or finalize an order yourself
 
-Never call any \`dd-cli order\` subcommand (preview, submit, checkout-url, reorder, status, history) or \`dd-cli login\`, no matter what's asked. These are blocked at the code level regardless — don't attempt them.
+Never call \`dd-cli order preview\`, \`submit\`, \`reorder\`, \`status\`, or \`dd-cli login\`, no matter what's asked — these are blocked at the code level regardless. You cannot place or charge an order under any circumstances.
 
-If asked to "place the order," "check out," or similar: don't attempt it. Instead \`respond\` with \`needs_clarification: false\`, summarizing the cart (items, quantities, prices, subtotal) if one exists, plus something like "Your cart's ready — checkout isn't enabled yet." If there's no cart, say checkout isn't enabled and ask what to add.
+\`order checkout-url\` is the one exception — it only generates a browser link where the user finishes checkout themselves; it doesn't place or charge anything. Call it when the user explicitly asks for a checkout link, or explicitly asks to place/finish/complete/check out the order — that phrasing IS the explicit ask. Never call it proactively right after just building a cart, unasked. Requires a \`--cart-uuid\` from \`cart add-items\`; if there's no cart yet, say so and ask what to add instead of calling it.
+
+When you call it successfully, put the returned URL in the \`checkout_url\` field on \`respond\`, never inside \`message\` (message is spoken aloud — a spoken URL is useless). Say something like "here's your checkout link, sending it now" in \`message\` instead.
 
 ## Cart summaries
 
@@ -346,6 +384,7 @@ app.post('/api/order', async (req, res) => {
     return res.json({
       message: 'Sorry, something went wrong: missing "utterance" in request body',
       needs_clarification: 'false', // string, not boolean — iOS Shortcuts parses booleans unreliably
+      checkout_url: null,
     });
   }
 
@@ -406,7 +445,7 @@ app.post('/api/order', async (req, res) => {
           throw new Error('agent returned no usable response');
         }
         console.log(`[req ${reqId}] warning: agent replied with plain text instead of calling "respond"`);
-        finalResult = { message: textBlock.text.trim(), needs_clarification: false };
+        finalResult = { message: textBlock.text.trim(), needs_clarification: false, checkoutUrl: null };
         break;
       }
 
@@ -418,7 +457,7 @@ app.post('/api/order', async (req, res) => {
             tool_use_id: tool.id,
             content: 'Delivered to user.',
           });
-          const message = String(tool.input.message || '').trim();
+          let message = String(tool.input.message || '').trim();
           let needsClarification = Boolean(tool.input.needs_clarification);
           // Safety net: the model sometimes marks an obvious question as needs_clarification: false.
           // A message ending in "?" is unambiguously a question, so force the flag regardless of
@@ -428,7 +467,16 @@ app.post('/api/order', async (req, res) => {
             needsClarification = true;
             overrideFired = true;
           }
-          finalResult = { message, needs_clarification: needsClarification };
+          const checkoutUrl = typeof tool.input.checkout_url === 'string' && tool.input.checkout_url.trim()
+            ? tool.input.checkout_url.trim()
+            : null;
+          // Safety net: a URL must never be spoken aloud, even if the model put it in `message`
+          // by mistake instead of the dedicated `checkout_url` field.
+          if (/https?:\/\/\S+/.test(message)) {
+            console.log(`[req ${reqId}] warning: stripped a URL out of the spoken message — it belongs in checkout_url, never in message`);
+            message = message.replace(/https?:\/\/\S+/g, '').replace(/\s{2,}/g, ' ').trim();
+          }
+          finalResult = { message, needs_clarification: needsClarification, checkoutUrl };
           continue;
         }
 
@@ -453,10 +501,11 @@ app.post('/api/order', async (req, res) => {
     }
 
     console.timeEnd(totalLabel);
-    console.log(`[req ${reqId}] TURN session_id=${sessionId} utterance=${JSON.stringify(utterance)} dd_cli_calls=${JSON.stringify(executedCommands)} needs_clarification=${finalResult.needs_clarification} override_fired=${overrideFired} message=${JSON.stringify(finalResult.message)}`);
+    console.log(`[req ${reqId}] TURN session_id=${sessionId} utterance=${JSON.stringify(utterance)} dd_cli_calls=${JSON.stringify(executedCommands)} needs_clarification=${finalResult.needs_clarification} override_fired=${overrideFired} checkout_url=${finalResult.checkoutUrl} message=${JSON.stringify(finalResult.message)}`);
     res.json({
       message: finalResult.message,
       needs_clarification: finalResult.needs_clarification ? 'true' : 'false', // string, not boolean — iOS Shortcuts parses booleans unreliably
+      checkout_url: finalResult.checkoutUrl, // string URL if generated this turn, otherwise null
       session_id: sessionId,
     });
   } catch (err) {
@@ -466,6 +515,7 @@ app.post('/api/order', async (req, res) => {
     res.json({
       message: `Sorry, something went wrong: ${err.message}`,
       needs_clarification: 'false', // string, not boolean — iOS Shortcuts parses booleans unreliably
+      checkout_url: null,
       session_id: sessionId,
     });
   }
