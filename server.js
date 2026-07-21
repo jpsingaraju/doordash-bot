@@ -333,11 +333,11 @@ Every "respond" \`message\` is spoken by text-to-speech, not displayed — plain
   - Late-night pattern (verified) → "it is 3am and this is your second late-night order this week. no judgment. actually, some judgment. placing it"
   - Error → "nope, cart add failed — Hakashi's system bounced it, item is probably out of stock. backup item, or want me to retry?"
 
-Location to search near (already resolved — do NOT call \`address list\`):
+Delivery address for this conversation (already resolved — do NOT call \`address list\` or \`address set\`):
   lat: ${address.lat}
   lng: ${address.lng}
   address: ${address.printableAddress}
-  source: ${address.source === 'client' ? "the user's current device location, sent with this request" : "the user's saved default DoorDash address"}
+  note: ${address.sourceNote}
 
 ## Commands you may use
 
@@ -398,68 +398,147 @@ Don't ask just because search returned 3 restaurants or a menu has many items �
 Be efficient: don't recheck something already confirmed this conversation, don't call \`menu\` on candidates you won't present, don't repeat a completed step. \`respond\` as soon as you have what you need.`;
 }
 
-// Cache the default/saved address in memory so we only ever call
-// `dd-cli address list` once per server process instead of once per request.
-let addressPromise = null;
+// dd-cli executed directly by server code (not by the model — model commands go
+// through runBashCommand and its allowlist). Used for address list/set, where the
+// server itself decides the arguments.
+function execDdCli(args) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      'dd-cli',
+      args,
+      { timeout: CLI_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (error) reject(new Error((stderr || error.message || 'dd-cli failed').trim()));
+        else resolve(stdout);
+      }
+    );
+  });
+}
 
-function resolveDefaultAddress() {
-  const label = '[address cache] resolve default address via dd-cli';
+// Cache the saved-address list with a short TTL: fresh enough to notice an address
+// added/changed in the DoorDash app, without paying ~1s of dd-cli per request.
+const ADDRESS_LIST_TTL_MS = 5 * 60 * 1000;
+let addressListState = null; // { promise, fetchedAt }
+
+async function fetchAddressList() {
+  const label = '[address cache] fetch address list via dd-cli';
   console.time(label);
-  return runBashCommand({ command: 'dd-cli --json-output address list' }, 'startup')
-    .then(({ output, isError }) => {
-      if (isError) {
-        throw new Error(output || 'dd-cli address list failed');
-      }
-      let parsed;
-      try {
-        parsed = JSON.parse(output);
-      } catch (e) {
-        throw new Error('could not parse dd-cli address list output');
-      }
-      const addresses = parsed.structuredContent?.addresses || [];
-      const defaultAddress = addresses.find((a) => a.is_default) || addresses[0];
-      if (!defaultAddress) {
-        throw new Error('no saved address found');
-      }
-      const address = {
-        lat: defaultAddress.lat,
-        lng: defaultAddress.lng,
-        printableAddress: defaultAddress.printable_address,
-        source: 'saved-default',
-      };
-      console.log(`[address cache] using default address: ${address.printableAddress} (${address.lat}, ${address.lng})`);
-      return address;
-    })
-    .finally(() => console.timeEnd(label));
-}
-
-function getDefaultAddress() {
-  if (!addressPromise) {
-    addressPromise = resolveDefaultAddress().catch((err) => {
-      addressPromise = null; // allow a retry on the next request if this failed
-      throw err;
-    });
+  try {
+    const stdout = await execDdCli(['--json-output', 'address', 'list']);
+    let parsed;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch (e) {
+      throw new Error('could not parse dd-cli address list output');
+    }
+    const addresses = parsed.structuredContent?.addresses || [];
+    if (addresses.length === 0) {
+      throw new Error('no saved address found');
+    }
+    return addresses;
+  } finally {
+    console.timeEnd(label);
   }
-  return addressPromise;
 }
 
-// If the client sends its current location (`lat`/`lng`, optionally a human-readable
-// `address`) in the request body, use that instead of the saved default address.
-// An iOS Shortcut can supply these via its "Get Current Location" action.
+function getAddressList() {
+  const now = Date.now();
+  if (addressListState && now - addressListState.fetchedAt < ADDRESS_LIST_TTL_MS) {
+    return addressListState.promise;
+  }
+  const state = { fetchedAt: now, promise: null };
+  state.promise = fetchAddressList().catch((err) => {
+    if (addressListState === state) addressListState = null; // allow retry on next request
+    throw err;
+  });
+  addressListState = state;
+  return state.promise;
+}
+
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.sqrt(a));
+}
+
+function toAddressInfo(a, sourceNote) {
+  return {
+    lat: a.lat,
+    lng: a.lng,
+    printableAddress: a.printable_address,
+    sourceNote,
+  };
+}
+
+// DoorDash anchors search results (and delivery) to the account's DEFAULT saved
+// address — arbitrary --lat/--lng is only a "hint" the backend largely ignores. So
+// when the client sends its device location, the useful move is to switch the
+// account default to whichever SAVED address is nearest the device, then search
+// from that address's coordinates. Beyond MAX_SWITCH_KM from every saved address,
+// switching would just pick a wrong address, so we keep the current default.
+const MAX_SWITCH_KM = 15;
+
+async function selectDeliveryAddress(clientLocation, reqId) {
+  const addresses = await getAddressList();
+  const currentDefault = addresses.find((a) => a.is_default) || addresses[0];
+
+  if (!clientLocation) {
+    return toAddressInfo(currentDefault, 'saved default address (no device location sent with this request)');
+  }
+
+  let nearest = null;
+  let nearestKm = Infinity;
+  for (const a of addresses) {
+    const km = haversineKm(clientLocation.lat, clientLocation.lng, a.lat, a.lng);
+    if (km < nearestKm) {
+      nearest = a;
+      nearestKm = km;
+    }
+  }
+
+  if (nearestKm > MAX_SWITCH_KM) {
+    console.log(
+      `[req ${reqId}] [address switch] device is ${nearestKm.toFixed(1)} km from the nearest saved address — keeping current default`
+    );
+    return toAddressInfo(
+      currentDefault,
+      `saved default address — but the user's device is ${Math.round(nearestKm)} km from every saved address, so results may not match where they physically are`
+    );
+  }
+
+  if (nearest.address_id === currentDefault.address_id) {
+    return toAddressInfo(nearest, "saved address nearest the user's current device location (already the default)");
+  }
+
+  try {
+    await execDdCli(['address', 'set', '--address-id', nearest.address_id, '--yes']);
+    for (const a of addresses) a.is_default = a.address_id === nearest.address_id;
+    console.log(
+      `[req ${reqId}] [address switch] default address switched: ${currentDefault.printable_address} -> ${nearest.printable_address} (${nearestKm.toFixed(1)} km from device)`
+    );
+    return toAddressInfo(nearest, "saved address nearest the user's current device location (account default switched to it)");
+  } catch (err) {
+    console.warn(`[req ${reqId}] [address switch] failed to switch default address: ${err.message}`);
+    return toAddressInfo(
+      currentDefault,
+      'saved default address (attempting to switch to the nearer saved address failed)'
+    );
+  }
+}
+
+// The client may send its current device location (`lat`/`lng`) in the request body
+// (an iOS Shortcut supplies these via its "Get Current Location" action). It's used
+// to pick the nearest SAVED DoorDash address — see selectDeliveryAddress.
 function parseClientLocation(body) {
   const lat = Number(body.lat);
   const lng = Number(body.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
   if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
-  return {
-    lat,
-    lng,
-    printableAddress:
-      typeof body.address === 'string' && body.address.trim()
-        ? body.address.trim()
-        : 'current device location (no street address provided)',
-    source: 'client',
-  };
+  return { lat, lng };
 }
 
 // In-memory session store: session_id -> { messages: Anthropic message history, lastActive: timestamp }.
@@ -519,12 +598,14 @@ app.post('/api/order', async (req, res) => {
 
   try {
     const clientLocation = parseClientLocation(req.body || {});
-    const address = clientLocation || (await getDefaultAddress());
-    console.log(
-      `[req ${reqId}] location: ${address.printableAddress} (${address.lat}, ${address.lng}) [${
-        clientLocation ? 'from request' : 'saved default'
-      }]`
-    );
+    if (!clientLocation) {
+      const b = req.body || {};
+      console.log(
+        `[req ${reqId}] no usable client location — body keys: ${JSON.stringify(Object.keys(b))}, lat=${JSON.stringify(b.lat)}, lng=${JSON.stringify(b.lng)}`
+      );
+    }
+    const address = await selectDeliveryAddress(clientLocation, reqId);
+    console.log(`[req ${reqId}] delivery address: ${address.printableAddress} (${address.lat}, ${address.lng}) [${address.sourceNote}]`);
     const systemPrompt = buildSystemPrompt(address);
 
     let finalResult = null;
@@ -629,19 +710,23 @@ app.post('/api/order', async (req, res) => {
   }
 });
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
-// Load the default delivery location before accepting any requests, every time the
-// server starts. If it can't be loaded (e.g. dd-cli not logged in), exit loudly now
-// instead of failing on the first real request.
-getDefaultAddress()
-  .then(() => {
+// Load the saved-address list before accepting any requests, every time the server
+// starts. If it can't be loaded (e.g. dd-cli not logged in), exit loudly now instead
+// of failing on the first real request.
+getAddressList()
+  .then((addresses) => {
+    const def = addresses.find((a) => a.is_default) || addresses[0];
+    console.log(
+      `[address cache] loaded ${addresses.length} saved address(es); current default: ${def.printable_address} (${def.lat}, ${def.lng})`
+    );
     app.listen(PORT, () => {
       console.log(`doordash-bot server listening on http://localhost:${PORT}`);
     });
   })
   .catch((err) => {
-    console.error(`[address cache] could not load default address at startup: ${err.message}`);
+    console.error(`[address cache] could not load saved addresses at startup: ${err.message}`);
     console.error('[address cache] check that dd-cli is installed, logged in, and has a saved address, then run npm start again.');
     process.exit(1);
   });
