@@ -333,10 +333,11 @@ Every "respond" \`message\` is spoken by text-to-speech, not displayed — plain
   - Late-night pattern (verified) → "it is 3am and this is your second late-night order this week. no judgment. actually, some judgment. placing it"
   - Error → "nope, cart add failed — Hakashi's system bounced it, item is probably out of stock. backup item, or want me to retry?"
 
-Default delivery location (already resolved — do NOT call \`address list\`):
+Location to search near (already resolved — do NOT call \`address list\`):
   lat: ${address.lat}
   lng: ${address.lng}
   address: ${address.printableAddress}
+  source: ${address.source === 'client' ? "the user's current device location, sent with this request" : "the user's saved default DoorDash address"}
 
 ## Commands you may use
 
@@ -424,6 +425,7 @@ function resolveDefaultAddress() {
         lat: defaultAddress.lat,
         lng: defaultAddress.lng,
         printableAddress: defaultAddress.printable_address,
+        source: 'saved-default',
       };
       console.log(`[address cache] using default address: ${address.printableAddress} (${address.lat}, ${address.lng})`);
       return address;
@@ -439,6 +441,25 @@ function getDefaultAddress() {
     });
   }
   return addressPromise;
+}
+
+// If the client sends its current location (`lat`/`lng`, optionally a human-readable
+// `address`) in the request body, use that instead of the saved default address.
+// An iOS Shortcut can supply these via its "Get Current Location" action.
+function parseClientLocation(body) {
+  const lat = Number(body.lat);
+  const lng = Number(body.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+  return {
+    lat,
+    lng,
+    printableAddress:
+      typeof body.address === 'string' && body.address.trim()
+        ? body.address.trim()
+        : 'current device location (no street address provided)',
+    source: 'client',
+  };
 }
 
 // In-memory session store: session_id -> { messages: Anthropic message history, lastActive: timestamp }.
@@ -497,7 +518,13 @@ app.post('/api/order', async (req, res) => {
   let overrideFired = false;
 
   try {
-    const address = await getDefaultAddress();
+    const clientLocation = parseClientLocation(req.body || {});
+    const address = clientLocation || (await getDefaultAddress());
+    console.log(
+      `[req ${reqId}] location: ${address.printableAddress} (${address.lat}, ${address.lng}) [${
+        clientLocation ? 'from request' : 'saved default'
+      }]`
+    );
     const systemPrompt = buildSystemPrompt(address);
 
     let finalResult = null;
@@ -603,10 +630,18 @@ app.post('/api/order', async (req, res) => {
 });
 
 const PORT = 3000;
-app.listen(PORT, () => {
-  console.log(`doordash-bot server listening on http://localhost:${PORT}`);
-  // Pre-warm the address cache so the first real request doesn't pay for it.
-  getDefaultAddress().catch((err) => {
-    console.error(`[address cache] failed to pre-warm: ${err.message}`);
+
+// Load the default delivery location before accepting any requests, every time the
+// server starts. If it can't be loaded (e.g. dd-cli not logged in), exit loudly now
+// instead of failing on the first real request.
+getDefaultAddress()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`doordash-bot server listening on http://localhost:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error(`[address cache] could not load default address at startup: ${err.message}`);
+    console.error('[address cache] check that dd-cli is installed, logged in, and has a saved address, then run npm start again.');
+    process.exit(1);
   });
-});
