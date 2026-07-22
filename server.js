@@ -116,10 +116,10 @@ const RESPOND_TOOL = {
         description:
           'true if this message is a clarifying question and you need more information before you can complete the task; false if this is the final answer.',
       },
-      checkout_url: {
-        type: 'string',
+      order_placed: {
+        type: 'boolean',
         description:
-          'ONLY set this if you successfully called `dd-cli order checkout-url` this turn — put the exact URL it returned here. Omit this field entirely otherwise. Never put the URL inside `message` — message is spoken aloud via text-to-speech and a spoken URL is useless; just say something like "here\'s your checkout link, sending it now" in message instead.',
+          'Set to true ONLY on the turn where `dd-cli order submit` succeeded AND `order status` did not come back failed or action_required — it tells the client the order is placed and the conversation is over. Omit it or set false on every other message, including the pre-submit confirmation question. The server independently verifies a submit ran this turn and overrides false if not.',
       },
     },
     required: ['message', 'needs_clarification'],
@@ -127,17 +127,27 @@ const RESPOND_TOOL = {
 };
 
 const MODEL = 'claude-haiku-4-5-20251001';
-const MAX_STEPS = 10;
+// A step = one Claude call; each dd-cli call and the final respond each consume one.
+// "Order my usual + required-modifier item" flows legitimately need ~10; the last
+// step is always forced to `respond` (see tool_choice below) so a turn can never
+// die with "did not finish within the step limit".
+const MAX_STEPS = 16;
 const CLI_TIMEOUT_MS = 20000;
+// `order submit` has a 30s server-side timeout with no auto-retry — give it more
+// headroom than the general CLI timeout so we never kill a submit that would have
+// succeeded (an ambiguous kill still burns the cart's one submit attempt).
+const SUBMIT_TIMEOUT_MS = 45000;
 const SESSION_TTL_MS = 5 * 60 * 1000;
 
 // Code-level allowlist — the ONLY dd-cli commands the agent may execute, enforced
 // below regardless of what the model asks for. `null` = leaf command (no subcommand
 // to check); a Set = the group's allowed subcommands, everything else in that group
-// is denied. `order` allows `history` (read-only) and `checkout-url` (generates a
-// browser link only — it does not finalize/charge anything). `preview`/`submit`/
-// `reorder`/`status` stay blocked — no path from here to actually placing an order.
-// `login` is denied by default (not a key below).
+// is denied. `order` allows `history`/`preview`/`status` (read-only) and `submit`
+// (places a real order and charges the default payment method) — submit is further
+// gated in runBashCommand: it requires a successful `order preview` for the same
+// cart on an EARLIER turn (so the user was actually asked and said yes in between)
+// and each cart can only ever be submitted once (submit is not idempotent).
+// `reorder`, `receipt`, `checkout-url`, and `login` remain blocked.
 const ALLOWED_COMMANDS = {
   search: null,
   menu: null,
@@ -150,7 +160,7 @@ const ALLOWED_COMMANDS = {
   cart: new Set(['add-items', 'show', 'remove-item']), // 'delete' and 'list' are not permitted
   'payment-method': new Set(['list']), // the only subcommand; read-only
   promo: new Set(['apply', 'list', 'remove']),
-  order: new Set(['history', 'checkout-url']), // read-only history + browser-link generation; preview/submit/reorder/status remain blocked
+  order: new Set(['history', 'preview', 'submit', 'status']), // submit is additionally guarded in runBashCommand; reorder/receipt/checkout-url remain blocked
 };
 
 function findCommandAndSubcommand(args) {
@@ -196,6 +206,11 @@ function checkAllowlist(args) {
   return { allowed: true };
 }
 
+function getFlagValue(args, flag) {
+  const i = args.indexOf(flag);
+  return i !== -1 && i + 1 < args.length && typeof args[i + 1] === 'string' ? args[i + 1] : null;
+}
+
 // `menu` returns every item's long `description` prose and CDN `image_url` on all ~94 items —
 // neither is needed to pick items for a cart or to check `store_is_open`, and dd-cli's own docs
 // say to ignore `is_popular`/`popularity_rank`. Stripping these keeps everything the agent
@@ -235,7 +250,7 @@ function slimMenuOutput(rawOutput) {
   });
 }
 
-function runBashCommand(input, reqId) {
+function runBashCommand(input, reqId, session, turnState) {
   return new Promise((resolve) => {
     if (input.restart) {
       return resolve({ output: 'ok', isError: false, ddCliCommand: null });
@@ -254,25 +269,85 @@ function runBashCommand(input, reqId) {
     }
 
     const args = parsed.slice(1);
-    const { command: ddCliCommand } = findCommandAndSubcommand(args);
+    const { command: ddCliCommand, subcommand: ddCliSubcommand } = findCommandAndSubcommand(args);
     const { allowed, reason } = checkAllowlist(args);
     if (!allowed) {
       console.warn(`[req ${reqId}] [SECURITY] blocked disallowed dd-cli command (${reason}): ${command}`);
       return resolve({
-        output: `Error: this command is not permitted by the agent's execution policy (${reason}). Checkout/order-placement commands and login are never available to you.`,
+        output: `Error: this command is not permitted by the agent's execution policy (${reason}).`,
         isError: true,
         ddCliCommand,
       });
     }
 
+    const isSubmit = ddCliCommand === 'order' && ddCliSubcommand === 'submit';
+    const isPreview = ddCliCommand === 'order' && ddCliSubcommand === 'preview';
+    const cartUuid = isSubmit || isPreview ? getFlagValue(args, '--cart-uuid') : null;
+
+    let execArgs = args;
+    if (isSubmit) {
+      // Code-level submit guards, enforced regardless of what the model asks for.
+      // (1) preview-first, on an EARLIER turn: guarantees a confirmation question
+      // actually reached the user between preview and submit. (2) one submit per
+      // cart, ever: submit is not idempotent — a re-submit is a duplicate charge.
+      if (!cartUuid) {
+        return resolve({ output: 'Error: order submit requires --cart-uuid.', isError: true, ddCliCommand });
+      }
+      const previewed = session.previewedCarts.get(cartUuid);
+      if (!previewed) {
+        console.warn(`[req ${reqId}] [SECURITY] blocked order submit without a prior preview: ${command}`);
+        return resolve({
+          output: 'Error: order submit is blocked — run `order preview` for this cart first, present the total, payment card, and tip to the user with needs_clarification true, and submit only after their explicit yes on a later turn.',
+          isError: true,
+          ddCliCommand,
+        });
+      }
+      if (previewed.reqId === reqId) {
+        console.warn(`[req ${reqId}] [SECURITY] blocked same-turn preview+submit: ${command}`);
+        return resolve({
+          output: 'Error: order submit is blocked this turn — the preview for this cart ran in this same turn, so the user has not confirmed yet. Present the preview (total, card, tip) with needs_clarification true and submit only after their explicit yes on the next turn.',
+          isError: true,
+          ddCliCommand,
+        });
+      }
+      if (session.submittedCarts.has(cartUuid)) {
+        console.warn(`[req ${reqId}] [SECURITY] blocked duplicate order submit for cart ${cartUuid}`);
+        return resolve({
+          output: 'Error: this cart was already submitted once — re-submitting would place a duplicate order and charge the user twice. Check `order status` or `order history` to see whether it went through.',
+          isError: true,
+          ddCliCommand,
+        });
+      }
+      // Mark the cart spent BEFORE executing: a timeout or ambiguous failure may
+      // still have placed the order server-side, so a second attempt must never run.
+      session.submittedCarts.add(cartUuid);
+      if (!args.includes('--yes') && !args.includes('-y')) {
+        execArgs = [...args, '--yes']; // non-TTY submit hangs forever on the interactive Proceed? prompt without it
+      }
+    }
+
     execFile(
       'dd-cli',
-      args,
-      { timeout: CLI_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
+      execArgs,
+      { timeout: isSubmit ? SUBMIT_TIMEOUT_MS : CLI_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
       (error, stdout, stderr) => {
         if (error) {
           resolve({ output: (stderr || error.message || 'command failed').trim(), isError: true, ddCliCommand });
         } else {
+          if (isPreview && cartUuid) {
+            session.previewedCarts.set(cartUuid, { reqId });
+            turnState.previewedThisTurn.push(cartUuid);
+          }
+          if (isSubmit) {
+            // dd-cli can exit 0 with `"success": false` in the JSON body (e.g. invalid
+            // cart) — that is NOT a placed order and must not unlock ordered_status.
+            let submitOk = true;
+            try {
+              const p = JSON.parse(stdout);
+              if (p && (p.success === false || p.structuredContent?.success === false)) submitOk = false;
+            } catch (e) { /* not JSON — trust the exit code */ }
+            if (submitOk) turnState.submitSucceeded = true;
+          }
           let output = stdout;
           if (ddCliCommand === 'menu') {
             const before = output.length;
@@ -352,7 +427,9 @@ Anything not listed here is rejected by the server before it runs — don't try 
   - \`dd-cli --json-output payment-method list\` — read-only
   - \`dd-cli --json-output promo list/apply/remove\`
   - \`dd-cli --json-output order history --max <N> --days <N>\` — read-only past orders (store, items, date) — for verifying real patterns before a callback. No pricing data.
-  - \`dd-cli --json-output order checkout-url --cart-uuid <uuid>\` — generates a browser link to finish checkout there. Does NOT place or charge anything itself. Only these two \`order\` subcommands are available to you.
+  - \`dd-cli --json-output order preview --cart-uuid <uuid>\` — authoritative order pricing (total, fees, tip suggestion, delivery availability). Read-only, no charge. Required before any submit.
+  - \`dd-cli --json-output order submit --cart-uuid <uuid> --tip-cents <N> --yes\` — PLACES THE ORDER and charges the account's default payment method immediately. Only via the exact flow in "Placing an order" below.
+  - \`dd-cli --json-output order status --order-uuid <uuid>\` — verify a submitted order actually went through. Only these four \`order\` subcommands are available to you.
 
 \`cart list\` isn't available — \`cart add-items\` will append to an existing open cart automatically; that's expected.
 
@@ -374,17 +451,33 @@ Before your first \`cart add-items\` call that includes \`nested_options\` in th
 
 If a customized \`add-items\` call fails (error, or \`item_errors\`/\`required_options\` again): make exactly one corrective retry, and only after re-comparing the \`--help\` output against \`item-details\` to find the actual mismatch — not another guess. If that also fails, stop and ask the user whether to add the item without customization or keep trying. Never guess a third time.
 
-## HARD RULE — never place, submit, or finalize an order yourself
+## Placing an order — strict flow, enforced in code
 
-Never call \`dd-cli order preview\`, \`submit\`, \`reorder\`, \`status\`, or \`dd-cli login\`, no matter what is asked — these are blocked at the code level regardless. You cannot place or charge an order under any circumstances.
+You CAN place real orders — this charges real money to the user's default DoorDash payment method — but ONLY through this exact sequence. The server enforces the sequence (preview-first on an earlier turn, one submit per cart, ever); skipping a step gets the command rejected, but do not rely on that — follow the flow.
 
-\`order checkout-url\` is the one exception — it only generates a browser link where the user finishes checkout themselves; it does not place or charge anything. Call it when the user explicitly asks for a checkout link, or explicitly asks to place/finish/complete/check out the order — that phrasing IS the explicit ask. Never call it proactively right after just building a cart, unasked. Requires a \`--cart-uuid\` from \`cart add-items\`; if there is no cart yet, say so and ask what to add instead of calling it.
+1. **Only begin checkout when the user explicitly asks** to order / place it / check out / finish. Never proactively after just building a cart. If there is no cart yet, say so and ask what to add.
+2. **Preview + payment method.** Run \`order preview --cart-uuid <uuid>\` and \`payment-method list\`.
+   - Authoritative total: \`quote.net_total_before_tip.display_string\` — use it verbatim, never recompute from line items.
+   - Default card: the \`cards[]\` entry whose \`payment_method_id\` equals the top-level \`default_payment_method_id\` — you need its brand + last4.
+   - Suggested Dasher tip: \`quote.tips_suggestion_details[0]\` — \`percentage_to_amount_monetary_values[default_index].unit_amount\` is CENTS. Empty/missing → there is no suggested number; still ask, just without one.
+3. **Ask ONE confirmation question** (\`needs_clarification: true\`) that names all three: the total, the card by identity ("your Visa ending 3626"), and the Dasher tip (the suggested amount, a different amount, or none). A delivery order MUST get a tip answer before submit — disclosure is required by regulation; \`--tip-cents 0\` is only valid on an explicit decline, never on silence. Pickup orders have no Dasher: skip the tip question entirely and submit with \`--tip-cents 0\`.
+   - Preview and submit can never happen in the same turn — the server rejects it. Preview, ask, and submit only after the user's yes on a later turn.
+   - If the default card cannot be resolved (\`cards[]\` empty or no match — the real default may be a wallet like Apple Pay that the CLI cannot see): do NOT name a card you cannot verify. Ask with "DoorDash will charge whatever default payment method is on your account, card or wallet — still good?"
+   - Paying with a DIFFERENT card is not possible from here — tell them to finish this cart in the DoorDash app instead (the cart is synced to their account).
+4. **Submit only on an explicit yes** ("yes", "do it", "place it", "go ahead" — a joke, a question back, or silence is not a yes): \`order submit --cart-uuid <uuid> --tip-cents <N> --yes\`. \`--tip-cents\` is CENTS, not dollars — 500 is $5.00, 5 is five cents. If the user changed anything in their answer (tip, items), that is a new confirmation — update, re-ask, never guess.
+5. **Verify before you celebrate.** Submit returning success means "accepted for processing", not "placed". Run \`order status --order-uuid <uuid from submit>\`; check up to 3 times.
+   - no longer \`pending\` and not \`failed\`/\`action_required\` → the order is placed: say so, and set \`order_placed: true\` on \`respond\`.
+   - still \`pending\` after 3 checks → say the order went through and is still finalizing and will show up in their DoorDash app — \`order_placed: true\` is still correct here.
+   - \`action_required\` → they must finish a verification step in the DoorDash app; say exactly that, \`order_placed\` stays false — do NOT claim it is placed.
+   - \`failed\` → it did not go through; say so plainly, \`order_placed\` stays false.
+6. **Never submit the same cart twice** — submit is not idempotent; a re-submit is a duplicate charge. The server blocks it. If a submit errored or timed out and you are unsure, check \`order status\` / \`order history\` — never retry the submit.
+7. **Restricted items**: if submit fails mentioning age-restricted items (AGENTIC_RESTRICTED_ITEM_NOT_ALLOWED), say the cart has restricted items that cannot be ordered by voice and they need to finish this one in the DoorDash app.
 
-When you call it successfully, put the returned URL in the \`checkout_url\` field on \`respond\`, never inside \`message\` (message is spoken aloud — a spoken URL is useless). Say something like "here is your checkout link, sending it now" in \`message\` instead.
+Never call \`dd-cli order reorder\`, \`receipt\`, \`checkout-url\`, or \`dd-cli login\` — blocked at the code level.
 
 ## Cart summaries
 
-\`cart show\` gives per-item \`price\`/\`quantity\` but no order-level total (that's \`order preview\`, which you can't call). Compute a subtotal yourself (sum of price × quantity) and label it a subtotal, not a final total — tax/fees/tip aren't included.
+\`cart show\` gives per-item \`price\`/\`quantity\` but no order-level total. While the user is still building the cart, compute a subtotal yourself (sum of price × quantity) and label it a subtotal, not a final total — tax/fees/tip aren't included. The authoritative total comes from \`order preview\` once they ask to order.
 
 Ask a clarifying question (\`needs_clarification: true\`) instead of guessing when:
   - the request is too vague to act on ("get me food"),
@@ -395,11 +488,13 @@ Ask a clarifying question (\`needs_clarification: true\`) instead of guessing wh
 
 Don't ask just because search returned 3 restaurants or a menu has many items — that's normal, not ambiguity.
 
-Be efficient: don't recheck something already confirmed this conversation, don't call \`menu\` on candidates you won't present, don't repeat a completed step. \`respond\` as soon as you have what you need.`;
+Be efficient: don't recheck something already confirmed this conversation, don't call \`menu\` on candidates you won't present, don't repeat a completed step. \`respond\` as soon as you have what you need.
+
+You have a hard budget of ~15 tool steps per turn. Never guess an id — every \`--store-id\`/\`--menu-id\`/\`--item-id\` must come from actual \`menu\`, \`search\`, or \`order history\` output this conversation (never \`--menu-id 0\`). Shell pipes/redirects and root \`dd-cli --help\` are blocked — the only \`--help\` you may run is \`dd-cli cart add-items --help\`. If the same command has errored twice, stop — \`respond\` with what happened and what you need instead of exploring.`;
 }
 
 // dd-cli executed directly by server code (not by the model — model commands go
-// through runBashCommand and its allowlist). Used for address list/set, where the
+// through runBashCommand and its allowlist). Used for address list, where the
 // server itself decides the arguments.
 function execDdCli(args) {
   return new Promise((resolve, reject) => {
@@ -455,93 +550,23 @@ function getAddressList() {
   return state.promise;
 }
 
-function haversineKm(lat1, lng1, lat2, lng2) {
-  const toRad = (d) => (d * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
-  return 2 * 6371 * Math.asin(Math.sqrt(a));
-}
-
-function toAddressInfo(a, sourceNote) {
+// Delivery always uses the account's default saved DoorDash address (loaded and
+// cached via getAddressList) — no device-location handling, no address switching.
+async function getDefaultAddress() {
+  const addresses = await getAddressList();
+  const a = addresses.find((x) => x.is_default) || addresses[0];
   return {
     lat: a.lat,
     lng: a.lng,
     printableAddress: a.printable_address,
-    sourceNote,
+    sourceNote: 'saved default address',
   };
 }
 
-// DoorDash anchors search results (and delivery) to the account's DEFAULT saved
-// address — arbitrary --lat/--lng is only a "hint" the backend largely ignores. So
-// when the client sends its device location, the useful move is to switch the
-// account default to whichever SAVED address is nearest the device, then search
-// from that address's coordinates. Beyond MAX_SWITCH_KM from every saved address,
-// switching would just pick a wrong address, so we keep the current default.
-const MAX_SWITCH_KM = 15;
-
-async function selectDeliveryAddress(clientLocation, reqId) {
-  const addresses = await getAddressList();
-  const currentDefault = addresses.find((a) => a.is_default) || addresses[0];
-
-  if (!clientLocation) {
-    return toAddressInfo(currentDefault, 'saved default address (no device location sent with this request)');
-  }
-
-  let nearest = null;
-  let nearestKm = Infinity;
-  for (const a of addresses) {
-    const km = haversineKm(clientLocation.lat, clientLocation.lng, a.lat, a.lng);
-    if (km < nearestKm) {
-      nearest = a;
-      nearestKm = km;
-    }
-  }
-
-  if (nearestKm > MAX_SWITCH_KM) {
-    console.log(
-      `[req ${reqId}] [address switch] device is ${nearestKm.toFixed(1)} km from the nearest saved address — keeping current default`
-    );
-    return toAddressInfo(
-      currentDefault,
-      `saved default address — but the user's device is ${Math.round(nearestKm)} km from every saved address, so results may not match where they physically are`
-    );
-  }
-
-  if (nearest.address_id === currentDefault.address_id) {
-    return toAddressInfo(nearest, "saved address nearest the user's current device location (already the default)");
-  }
-
-  try {
-    await execDdCli(['address', 'set', '--address-id', nearest.address_id, '--yes']);
-    for (const a of addresses) a.is_default = a.address_id === nearest.address_id;
-    console.log(
-      `[req ${reqId}] [address switch] default address switched: ${currentDefault.printable_address} -> ${nearest.printable_address} (${nearestKm.toFixed(1)} km from device)`
-    );
-    return toAddressInfo(nearest, "saved address nearest the user's current device location (account default switched to it)");
-  } catch (err) {
-    console.warn(`[req ${reqId}] [address switch] failed to switch default address: ${err.message}`);
-    return toAddressInfo(
-      currentDefault,
-      'saved default address (attempting to switch to the nearer saved address failed)'
-    );
-  }
-}
-
-// The client may send its current device location (`lat`/`lng`) in the request body
-// (an iOS Shortcut supplies these via its "Get Current Location" action). It's used
-// to pick the nearest SAVED DoorDash address — see selectDeliveryAddress.
-function parseClientLocation(body) {
-  const lat = Number(body.lat);
-  const lng = Number(body.lng);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
-  return { lat, lng };
-}
-
-// In-memory session store: session_id -> { messages: Anthropic message history, lastActive: timestamp }.
+// In-memory session store: session_id -> { messages: Anthropic message history, lastActive: timestamp,
+// previewedCarts: Map<cartUuid, { reqId }> (successful `order preview` runs, keyed to the request that
+// ran them — the submit guard requires the preview to be from an EARLIER request), submittedCarts:
+// Set<cartUuid> (carts that have had a submit attempt; never submittable again).
 // No database — sessions are expired on inactivity and cleaned up opportunistically on each request.
 const sessions = new Map();
 
@@ -565,7 +590,7 @@ app.post('/api/order', async (req, res) => {
     return res.json({
       message: 'Sorry, something went wrong: missing "utterance" in request body',
       needs_clarification: 'false', // string, not boolean — iOS Shortcuts parses booleans unreliably
-      checkout_url: null,
+      ordered_status: 'false',
     });
   }
 
@@ -580,7 +605,7 @@ app.post('/api/order', async (req, res) => {
   } else {
     isNewSession = true;
     sessionId = sessionId || crypto.randomUUID();
-    session = { messages: [], lastActive: Date.now() };
+    session = { messages: [], lastActive: Date.now(), previewedCarts: new Map(), submittedCarts: new Set() };
     sessions.set(sessionId, session);
   }
   session.lastActive = Date.now();
@@ -595,16 +620,13 @@ app.post('/api/order', async (req, res) => {
 
   const executedCommands = []; // dd-cli commands actually run this turn, for the turn summary log below
   let overrideFired = false;
+  // Per-turn order state: `submitSucceeded` gates the ordered_status response field (the model
+  // can never claim an order it did not place); `previewedThisTurn` lets a failed turn roll back
+  // its preview records so a retried turn can't submit against a confirmation the user never heard.
+  const turnState = { submitSucceeded: false, previewedThisTurn: [] };
 
   try {
-    const clientLocation = parseClientLocation(req.body || {});
-    if (!clientLocation) {
-      const b = req.body || {};
-      console.log(
-        `[req ${reqId}] no usable client location — body keys: ${JSON.stringify(Object.keys(b))}, lat=${JSON.stringify(b.lat)}, lng=${JSON.stringify(b.lng)}`
-      );
-    }
-    const address = await selectDeliveryAddress(clientLocation, reqId);
+    const address = await getDefaultAddress();
     console.log(`[req ${reqId}] delivery address: ${address.printableAddress} (${address.lat}, ${address.lng}) [${address.sourceNote}]`);
     const systemPrompt = buildSystemPrompt(address);
 
@@ -618,7 +640,10 @@ app.post('/api/order', async (req, res) => {
         max_tokens: 1024,
         system: systemPrompt,
         tools: [BASH_TOOL, RESPOND_TOOL],
-        tool_choice: { type: 'any' }, // force a tool call every turn — never let it end the turn with plain text
+        // Force a tool call every turn — never let it end the turn with plain text. On the
+        // final step, force `respond` specifically so the agent must wrap up and tell the
+        // user where things stand instead of dying on the step limit mid-task.
+        tool_choice: step === MAX_STEPS - 1 ? { type: 'tool', name: 'respond' } : { type: 'any' },
         messages: session.messages,
       });
       console.timeEnd(claudeLabel);
@@ -634,7 +659,7 @@ app.post('/api/order', async (req, res) => {
           throw new Error('agent returned no usable response');
         }
         console.log(`[req ${reqId}] warning: agent replied with plain text instead of calling "respond"`);
-        finalResult = { message: expandContractions(textBlock.text.trim()), needs_clarification: false, checkoutUrl: null };
+        finalResult = { message: expandContractions(textBlock.text.trim()), needs_clarification: false, orderPlaced: false };
         break;
       }
 
@@ -656,22 +681,25 @@ app.post('/api/order', async (req, res) => {
             needsClarification = true;
             overrideFired = true;
           }
-          const checkoutUrl = typeof tool.input.checkout_url === 'string' && tool.input.checkout_url.trim()
-            ? tool.input.checkout_url.trim()
-            : null;
-          // Safety net: a URL must never be spoken aloud, even if the model put it in `message`
-          // by mistake instead of the dedicated `checkout_url` field.
+          // Safety net: ordered_status is only trustworthy if an `order submit` actually
+          // succeeded this turn — the model must never be able to claim an order it did not place.
+          let orderPlaced = Boolean(tool.input.order_placed);
+          if (orderPlaced && !turnState.submitSucceeded) {
+            console.log(`[req ${reqId}] warning: model set order_placed=true but no successful order submit ran this turn — overriding to false`);
+            orderPlaced = false;
+          }
+          // Safety net: a URL must never be spoken aloud (message goes to text-to-speech).
           if (/https?:\/\/\S+/.test(message)) {
-            console.log(`[req ${reqId}] warning: stripped a URL out of the spoken message — it belongs in checkout_url, never in message`);
+            console.log(`[req ${reqId}] warning: stripped a URL out of the spoken message`);
             message = message.replace(/https?:\/\/\S+/g, '').replace(/\s{2,}/g, ' ').trim();
           }
-          finalResult = { message, needs_clarification: needsClarification, checkoutUrl };
+          finalResult = { message, needs_clarification: needsClarification, orderPlaced };
           continue;
         }
 
         const bashLabel = `[req ${reqId}] bash tool call (step ${step + 1}, call ${idx + 1}): ${tool.input.command || '(restart)'}`;
         console.time(bashLabel);
-        const { output, isError } = await runBashCommand(tool.input, reqId);
+        const { output, isError } = await runBashCommand(tool.input, reqId, session, turnState);
         console.timeEnd(bashLabel);
         executedCommands.push({ command: tool.input.command || '(restart)', isError });
         toolResults.push({
@@ -690,21 +718,24 @@ app.post('/api/order', async (req, res) => {
     }
 
     console.timeEnd(totalLabel);
-    console.log(`[req ${reqId}] TURN session_id=${sessionId} utterance=${JSON.stringify(utterance)} dd_cli_calls=${JSON.stringify(executedCommands)} needs_clarification=${finalResult.needs_clarification} override_fired=${overrideFired} checkout_url=${finalResult.checkoutUrl} message=${JSON.stringify(finalResult.message)}`);
+    console.log(`[req ${reqId}] TURN session_id=${sessionId} utterance=${JSON.stringify(utterance)} dd_cli_calls=${JSON.stringify(executedCommands)} needs_clarification=${finalResult.needs_clarification} override_fired=${overrideFired} ordered_status=${finalResult.orderPlaced} message=${JSON.stringify(finalResult.message)}`);
     res.json({
       message: finalResult.message,
       needs_clarification: finalResult.needs_clarification ? 'true' : 'false', // string, not boolean — iOS Shortcuts parses booleans unreliably
-      checkout_url: finalResult.checkoutUrl, // string URL if generated this turn, otherwise null
+      ordered_status: finalResult.orderPlaced ? 'true' : 'false', // "true" ONLY on the turn an order was actually submitted and verified — the client's signal to speak the message and stop
       session_id: sessionId,
     });
   } catch (err) {
     session.messages.length = historySnapshotLength; // roll back this turn so the session stays valid for a retry
+    // Roll back preview records from this failed turn too — the confirmation question
+    // never reached the user, so a retried turn must not be able to submit against it.
+    for (const uuid of turnState.previewedThisTurn) session.previewedCarts.delete(uuid);
     console.timeEnd(totalLabel);
     console.log(`[req ${reqId}] TURN session_id=${sessionId} utterance=${JSON.stringify(utterance)} dd_cli_calls=${JSON.stringify(executedCommands)} error=${JSON.stringify(err.message)}`);
     res.json({
       message: `Sorry, something went wrong: ${err.message}`,
       needs_clarification: 'false', // string, not boolean — iOS Shortcuts parses booleans unreliably
-      checkout_url: null,
+      ordered_status: 'false',
       session_id: sessionId,
     });
   }
@@ -712,21 +743,25 @@ app.post('/api/order', async (req, res) => {
 
 const PORT = Number(process.env.PORT) || 3000;
 
-// Load the saved-address list before accepting any requests, every time the server
-// starts. If it can't be loaded (e.g. dd-cli not logged in), exit loudly now instead
-// of failing on the first real request.
-getAddressList()
-  .then((addresses) => {
-    const def = addresses.find((a) => a.is_default) || addresses[0];
-    console.log(
-      `[address cache] loaded ${addresses.length} saved address(es); current default: ${def.printable_address} (${def.lat}, ${def.lng})`
-    );
-    app.listen(PORT, () => {
-      console.log(`doordash-bot server listening on http://localhost:${PORT}`);
+if (require.main === module) {
+  // Load the saved-address list before accepting any requests, every time the server
+  // starts. If it can't be loaded (e.g. dd-cli not logged in), exit loudly now instead
+  // of failing on the first real request.
+  getAddressList()
+    .then((addresses) => {
+      const def = addresses.find((a) => a.is_default) || addresses[0];
+      console.log(
+        `[address cache] loaded ${addresses.length} saved address(es); current default: ${def.printable_address} (${def.lat}, ${def.lng})`
+      );
+      app.listen(PORT, () => {
+        console.log(`doordash-bot server listening on http://localhost:${PORT}`);
+      });
+    })
+    .catch((err) => {
+      console.error(`[address cache] could not load saved addresses at startup: ${err.message}`);
+      console.error('[address cache] check that dd-cli is installed, logged in, and has a saved address, then run npm start again.');
+      process.exit(1);
     });
-  })
-  .catch((err) => {
-    console.error(`[address cache] could not load saved addresses at startup: ${err.message}`);
-    console.error('[address cache] check that dd-cli is installed, logged in, and has a saved address, then run npm start again.');
-    process.exit(1);
-  });
+}
+
+module.exports = { runBashCommand, checkAllowlist };
